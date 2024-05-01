@@ -1,8 +1,8 @@
-version: '3'
+version: "3"
 
 services:
   app:
-    image: go_chat
+    build: .
     deploy:
       replicas: 3
     ports:
