@@ -1,18 +1,44 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
 )
 
+const channel = "chat"
+
 func main() {
+	redisHost := os.Getenv("REDIS_HOST")
+	redisPort := os.Getenv("REDIS_PORT")
+	rdb := redis.NewClient(&redis.Options{
+		Addr: fmt.Sprintf("%s:%s", redisHost, redisPort),
+	})
+
+	go func() {
+		ctx := context.Background()
+		sub := rdb.Subscribe(ctx, channel)
+		for {
+			message, err := sub.ReceiveMessage(ctx)
+			if err != nil {
+				fmt.Println("Error receiving message", err)
+			}
+			if message != nil {
+				broadcast([]byte(message.Payload))
+			}
+		}
+	}()
 
 	router := gin.Default()
 	router.StaticFile("/", "./static/index.html")
-	router.GET("/ws", serveWs)
+	router.GET("/ws", serveWs(rdb))
 	err := router.Run()
 	if err != nil {
 		log.Fatalf("Unable to start server. Error %v", err)
@@ -20,16 +46,17 @@ func main() {
 	log.Println("Server started successfully.")
 }
 
-func serveWs(c *gin.Context) {
+func serveWs(rdb *redis.Client) func(c *gin.Context) {
+	return func(c *gin.Context) {
+		upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+		if err != nil {
+			log.Printf("Error in upgrading web socket. Error: %v", err)
+			return
+		}
 
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
-	if err != nil {
-		log.Printf("Error in upgrading web socket. Error: %v", err)
-		return
+		go handleClient(conn, rdb)
 	}
-
-	go handleClient(conn)
 }
 
 var clients = make(map[*websocket.Conn]struct{})
@@ -39,13 +66,13 @@ type Message struct {
 	Message string `json:"message"`
 }
 
-func broadcast(msg Message) {
+func broadcast(msgBytes []byte) {
 	for conn := range clients {
-		conn.WriteJSON(msg)
+		conn.WriteMessage(websocket.TextMessage, msgBytes)
 	}
 }
 
-func handleClient(c *websocket.Conn) {
+func handleClient(c *websocket.Conn, rdb *redis.Client) {
 	defer func() {
 		delete(clients, c)
 		log.Println("Closing Websocket")
@@ -61,6 +88,15 @@ func handleClient(c *websocket.Conn) {
 			return
 		}
 
-		broadcast(msg)
+		msgBytes, err := json.Marshal(msg)
+		if err != nil {
+			fmt.Println("Err marshaling", err.Error())
+			return
+		}
+
+		err = rdb.Publish(context.Background(), channel, string(msgBytes)).Err()
+		if err != nil {
+			fmt.Println("Error publishing:", err.Error())
+		}
 	}
 }
